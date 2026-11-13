@@ -120,37 +120,88 @@ async function storedAnswer(key: string, hash: string): Promise<Outcome> {
   throw fail(409, "a request with this Idempotency-Key is still in progress");
 }
 
+// --- Level 5: stop anyone from spamming bookings ---------------------------
+
+const MAX_ATTEMPTS = 5;
+
 /**
- * Book a slot.
+ * Count this email's attempts in the last minute and record this one, in a
+ * single statement. One statement rather than a count followed by an insert,
+ * so there is no gap between deciding and recording for a flood of requests to
+ * slip through.
  *
- * Without an Idempotency-Key this is just `book`. With one: claim the key, do
- * the work, write the answer next to the key. Any later request carrying the
- * same key gets that stored answer and never reaches `book` at all - so a retry
- * cannot make a second booking. The same key with a different body is a 422.
+ * Nothing is inserted when the limit is already reached. If a refused attempt
+ * were recorded it would push the caller's own window forward, and they could
+ * never get out of it.
  */
-bookingsRouter.post("/bookings", async (req, res) => {
-  const { slotId, name, email } = readBooking(req.body);
-  const key = req.header("Idempotency-Key")?.trim() || null;
+const RECORD_ATTEMPT_SQL = `
+  INSERT INTO booking_attempts (email)
+  SELECT $1::text
+   WHERE (SELECT count(*) FROM booking_attempts
+           WHERE email = $1 AND created_at > now() - interval '60 seconds') < $2
+  RETURNING id
+`;
 
-  if (!key) {
-    const outcome = await book(slotId, name, email);
-    res.status(outcome.status).json(outcome.body);
-    return;
+/** How long until the oldest attempt in the window ages out, in whole seconds. */
+const RETRY_AFTER_SQL = `
+  SELECT greatest(1, ceil(extract(epoch from
+           (min(created_at) + interval '60 seconds' - now()))))::int AS seconds
+    FROM booking_attempts
+   WHERE email = $1 AND created_at > now() - interval '60 seconds'
+`;
+
+async function enforceRateLimit(email: string) {
+  const { rowCount } = await pool.query(RECORD_ATTEMPT_SQL, [email, MAX_ATTEMPTS]);
+  if (rowCount === 1) return; // under the limit, and now counted
+
+  const { rows } = await pool.query<{ seconds: number }>(RETRY_AFTER_SQL, [email]);
+  throw fail(429, "too many booking attempts for this email", {
+    "Retry-After": String(rows[0]?.seconds ?? 1),
+  });
+}
+
+// --- the whole POST /bookings pipeline -------------------------------------
+
+/**
+ * Levels 1-5 in the order they are checked. docs/DESIGN.md §3 explains why this
+ * order, and the one place it was reversed after building it.
+ */
+async function attemptBooking(
+  key: string | null,
+  slotId: string,
+  name: string,
+  email: string,
+): Promise<Outcome> {
+  const hash = key ? fingerprint(slotId, name, email) : null;
+
+  // A request we have already answered is not a new attempt: replaying a
+  // stored answer creates nothing, so it costs none of this email's budget.
+  // It also cannot be abused - the same key with a different body is refused,
+  // so one key can only ever produce one booking.
+  if (key && hash && (await readKey(key))) {
+    return storedAnswer(key, hash);
   }
 
-  const hash = fingerprint(slotId, name, email);
+  await enforceRateLimit(email);
 
-  if (!(await claimKey(key, hash))) {
-    const outcome = await storedAnswer(key, hash);
-    res.status(outcome.status).json(outcome.body);
-    return;
-  }
+  if (!key || !hash) return book(slotId, name, email);
+
+  // Someone claimed this key in the moment since we looked: use their answer.
+  if (!(await claimKey(key, hash))) return storedAnswer(key, hash);
 
   const outcome = await book(slotId, name, email);
   await pool.query(
     "UPDATE idempotency_keys SET status_code = $2, response_body = $3 WHERE key = $1",
     [key, outcome.status, JSON.stringify(outcome.body)],
   );
+  return outcome;
+}
+
+bookingsRouter.post("/bookings", async (req, res) => {
+  const { slotId, name, email } = readBooking(req.body);
+  const key = req.header("Idempotency-Key")?.trim() || null;
+
+  const outcome = await attemptBooking(key, slotId, name, email);
   res.status(outcome.status).json(outcome.body);
 });
 

@@ -539,19 +539,23 @@ async function level4() {
 
   console.log("  paging:");
 
-  /** Six bookings for one person, made one after another so the order is known. */
+  /**
+   * Five bookings for one person, made one after another so the order is known.
+   * Five and not six: level 5 allows five attempts per email per minute, so a
+   * sixth would be a 429. That is the rate limit working, not a paging bug.
+   */
   const madeIds: string[] = [];
 
-  await check("set up six bookings for one email", async () => {
+  await check("set up five bookings for one email", async () => {
     expectStatus(await call("POST", "/reset", { body: { slots: L4_SLOTS } }), 200);
-    for (const slot of L4_SLOTS) {
+    for (const slot of L4_SLOTS.slice(0, 5)) {
       const res = await call("POST", "/bookings", {
         body: { slot_id: slot.id, name: "Ada Obi", email: "ada@example.com" },
       });
       expectStatus(res, 201);
       madeIds.push(res.body.id);
     }
-    expect(madeIds.length === 6, `expected 6 bookings, got ${madeIds.length}`);
+    expect(madeIds.length === 5, `expected 5 bookings, got ${madeIds.length}`);
   });
 
   await check("email is required", async () => {
@@ -585,7 +589,7 @@ async function level4() {
     expect(res.body.next_cursor === null, `next_cursor should be null, got ${res.body.next_cursor}`);
   });
 
-  await check("limit=2 pages through all six without gaps or repeats", async () => {
+  await check("limit=2 pages through all five without gaps or repeats", async () => {
     const seen: string[] = [];
     let cursor: string | null = null;
     let pages = 0;
@@ -601,7 +605,7 @@ async function level4() {
       expect(pages <= 10, "too many pages - the cursor is probably not advancing");
     } while (cursor !== null);
 
-    expect(pages === 3, `expected 3 pages of 2, got ${pages}`);
+    expect(pages === 3, `expected 3 pages (2+2+1), got ${pages}`);
     expect(
       JSON.stringify(seen) === JSON.stringify(madeIds),
       `paged ids do not match: ${JSON.stringify(seen)}`,
@@ -610,20 +614,20 @@ async function level4() {
   });
 
   await check("the last page says next_cursor: null", async () => {
-    const first = await call("GET", "/bookings?email=ada@example.com&limit=5");
+    const first = await call("GET", "/bookings?email=ada@example.com&limit=3");
     expect(first.body.next_cursor !== null, "page 1 of 2 should have a cursor");
     const last = await call(
       "GET",
-      `/bookings?email=ada@example.com&limit=5&cursor=${encodeURIComponent(first.body.next_cursor)}`,
+      `/bookings?email=ada@example.com&limit=3&cursor=${encodeURIComponent(first.body.next_cursor)}`,
     );
-    expect(last.body.bookings.length === 1, `expected 1 left over, got ${last.body.bookings.length}`);
+    expect(last.body.bookings.length === 2, `expected 2 left over, got ${last.body.bookings.length}`);
     expect(last.body.next_cursor === null, "the last page should have no cursor");
   });
 
   await check("the email match ignores case", async () => {
     const res = await call("GET", "/bookings?email=ADA@Example.COM");
     expectStatus(res, 200);
-    expect(res.body.bookings.length === 6, `expected 6 bookings, got ${res.body.bookings.length}`);
+    expect(res.body.bookings.length === 5, `expected 5 bookings, got ${res.body.bookings.length}`);
   });
 
   await check("someone with no bookings gets an empty page, not a 404", async () => {
@@ -636,9 +640,139 @@ async function level4() {
   await check("cancelled bookings are still listed", async () => {
     expectStatus(await call("DELETE", `/bookings/${madeIds[0]}`), 200);
     const res = await call("GET", "/bookings?email=ada@example.com");
-    expect(res.body.bookings.length === 6, `expected 6 bookings, got ${res.body.bookings.length}`);
+    expect(res.body.bookings.length === 5, `expected 5 bookings, got ${res.body.bookings.length}`);
     const cancelled = res.body.bookings.find((b: any) => b.id === madeIds[0]);
     expect(cancelled?.status === "cancelled", `status: ${cancelled?.status}`);
+  });
+}
+
+// --- level 5 ----------------------------------------------------------------
+
+const L5_SLOTS = Array.from({ length: 8 }, (_, i) => ({
+  id: `r${i + 1}`,
+  provider: "Dr Ade",
+  start: future(60 * (i + 1)),
+  end: future(60 * (i + 1) + 30),
+}));
+
+async function level5() {
+  console.log("\nLevel 5 — five booking attempts per email per minute");
+
+  await check("POST /reset installs the level 5 fixture", async () => {
+    expectStatus(await call("POST", "/reset", { body: { slots: L5_SLOTS } }), 200);
+  });
+
+  await check("five succeed, the sixth is a 429 with Retry-After", async () => {
+    const email = "spammer@example.com";
+    for (let i = 0; i < 5; i++) {
+      const res = await call("POST", "/bookings", {
+        body: { slot_id: `r${i + 1}`, name: "Spammer", email },
+      });
+      expectStatus(res, 201);
+    }
+
+    const sixth = await call("POST", "/bookings", {
+      body: { slot_id: "r6", name: "Spammer", email },
+    });
+    expectStatus(sixth, 429);
+    expectErrorShape(sixth);
+
+    const retryAfter = sixth.headers.get("retry-after");
+    expect(retryAfter !== null, "Retry-After header is missing");
+    expect(/^\d+$/.test(retryAfter!), `Retry-After must be whole seconds, got "${retryAfter}"`);
+    const seconds = Number(retryAfter);
+    expect(seconds >= 1 && seconds <= 60, `Retry-After out of range: ${seconds}`);
+  });
+
+  await check("another email is unaffected", async () => {
+    const res = await call("POST", "/bookings", {
+      body: { slot_id: "r6", name: "Someone Else", email: "other@example.com" },
+    });
+    expectStatus(res, 201);
+  });
+
+  await check("failed attempts count too: five 404s, then a 429", async () => {
+    const email = "failer@example.com";
+    for (let i = 0; i < 5; i++) {
+      const res = await call("POST", "/bookings", {
+        body: { slot_id: "no-such-slot", name: "Failer", email },
+      });
+      expectStatus(res, 404);
+    }
+    const sixth = await call("POST", "/bookings", {
+      body: { slot_id: "r7", name: "Failer", email },
+    });
+    expectStatus(sixth, 429);
+  });
+
+  await check("requests rejected as invalid spend nothing", async () => {
+    const email = "careless@example.com";
+    for (let i = 0; i < 8; i++) {
+      const res = await call("POST", "/bookings", { body: { slot_id: "r7", name: "", email } });
+      expectStatus(res, 400);
+    }
+    // Still has its whole budget, because none of those got as far as booking.
+    const real = await call("POST", "/bookings", {
+      body: { slot_id: "r7", name: "Careless", email },
+    });
+    expectStatus(real, 201);
+  });
+
+  /**
+   * The check that justifies the ordering decision: replaying a stored answer
+   * creates nothing, so it must not spend the budget - otherwise a client that
+   * retries a few times could not book again for a minute.
+   */
+  await check("replaying an Idempotency-Key spends nothing", async () => {
+    expectStatus(await call("POST", "/reset", { body: { slots: L5_SLOTS } }), 200);
+
+    const email = "retrier@example.com";
+    const body = { slot_id: "r1", name: "Retrier", email };
+    const headers = { "Idempotency-Key": "retry-key" };
+
+    const first = await call("POST", "/bookings", { body, headers });
+    expectStatus(first, 201);
+
+    // Nine more retries - far past the limit of five.
+    for (let i = 0; i < 9; i++) {
+      const res = await call("POST", "/bookings", { body, headers });
+      expectStatus(res, 201);
+      expect(res.body.id === first.body.id, "every retry should be the same booking");
+    }
+
+    // And the email can still do real work.
+    const another = await call("POST", "/bookings", {
+      body: { slot_id: "r2", name: "Retrier", email },
+    });
+    expectStatus(another, 201);
+  });
+
+  await check("a blocked email recovers: Retry-After does not keep growing", async () => {
+    expectStatus(await call("POST", "/reset", { body: { slots: L5_SLOTS } }), 200);
+    const email = "patient@example.com";
+
+    for (let i = 0; i < 5; i++) {
+      expectStatus(
+        await call("POST", "/bookings", { body: { slot_id: `r${i + 1}`, name: "P", email } }),
+        201,
+      );
+    }
+
+    const blocked = await call("POST", "/bookings", {
+      body: { slot_id: "r6", name: "P", email },
+    });
+    expectStatus(blocked, 429);
+    const firstWait = Number(blocked.headers.get("retry-after"));
+
+    // Being refused must not extend the window. Ask again and the wait should
+    // be the same or shorter, never longer.
+    const again = await call("POST", "/bookings", { body: { slot_id: "r6", name: "P", email } });
+    expectStatus(again, 429);
+    const secondWait = Number(again.headers.get("retry-after"));
+    expect(
+      secondWait <= firstWait,
+      `refusals are extending the window: ${firstWait}s then ${secondWait}s`,
+    );
   });
 }
 
@@ -684,6 +818,7 @@ async function main() {
   await level2();
   await level3();
   await level4();
+  await level5();
   await errorShape();
 
   console.log(`\n${passed} passed, ${failures.length} failed`);

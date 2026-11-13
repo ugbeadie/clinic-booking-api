@@ -65,34 +65,42 @@ are checked in is not stated, and it is the most consequential decision here.
 2. X-API-Key                         → 401
 3. JSON parse                        → 400
 4. validate + normalise all fields   → 400
-5. rate limit on the email           → 429 + Retry-After
-6. Idempotency-Key gate              → 422 (same key, different body) | replay stored response
-7. slot exists                       → 404
-8. slot.start <= now()               → 400
-9. insert                            → 409 if the slot already has a confirmed booking
-10. store the response under the idempotency key, commit
+5. already answered under this key?  → replay stored response | 422 (same key, different body)
+6. rate limit on the email           → 429 + Retry-After
+7. claim the Idempotency-Key
+8. slot exists                       → 404
+9. slot.start <= now()               → 400
+10. insert                           → 409 if the slot already has a confirmed booking
+11. store the response under the key
 ```
 
 Reasoning for the contested positions:
 
-- **Rate limit (5) before the slot checks (7–9):** level 5 says failed attempts count.
+- **Rate limit (6) before the slot checks (8–10):** level 5 says failed attempts count.
   A client firing six requests at a nonexistent slot must see 404 ×5 then 429. If the
   limit were checked last, those 404s would never be counted.
-- **Rate limit (5) before idempotency (6):** a genuine trade-off. Putting it first
-  means a request retried more than five times with the same `Idempotency-Key` gets a
-  429 instead of its stored reply, in slight tension with "the same key returns the
-  same response". Putting idempotency first would let a client bypass the limit by
-  reusing one key. Level 5's rule is written without exceptions, so it wins; real
-  retries number two or three, not six.
+- **Replaying a stored answer (5) before the rate limit (6) — reversed after
+  building it.** This started out the other way round, on the grounds that level 5
+  states its rule without exceptions and that letting idempotency jump the queue would
+  be a way to bypass the limit. Writing level 5 showed the second half of that is
+  simply wrong: **one key can only ever produce one booking**, because the same key
+  with a different body is refused with a 422. A replay creates nothing, so it cannot
+  be used to spam, and charging it an attempt only punishes a client for retrying —
+  the exact behaviour level 4 asks for. Worse, the original order made level 4 and
+  level 5 contradict each other: six retries of one request would start returning 429
+  instead of the stored booking. A request that is *answered from storage* is not an
+  attempt. The conformance suite has a check for this ("replaying an Idempotency-Key
+  spends nothing") so it cannot regress.
 - **All validation in one step (4), ahead of the rate limit:** the rate limit is keyed
   on email, so there is no counter to charge until the email is known — validation has
-  to come first either way. An earlier draft validated the email alone at step 4 and
-  the other fields after the rate limit, so that a request with a valid email but an
-  empty name would still be counted as an attempt. That split costs more in
-  explanation than it buys: the trade is that a malformed request is rejected without
-  burning any of that email's budget, which no reasonable reading of level 5 requires.
+  to come first either way. An earlier draft validated the email alone and the other
+  fields later, so that a valid email with an empty name would still be counted. That
+  split costs more in explanation than it buys: the trade is that a malformed request
+  is rejected without spending any of that email's budget, which no reasonable reading
+  of level 5 requires.
 - **A rejected (429) request is not itself recorded as an attempt.** Otherwise the
-  window would keep extending itself and a blocked client could never recover.
+  window would keep extending itself and a blocked client could never recover. There is
+  a check for this too ("Retry-After does not keep growing").
 
 `Retry-After` = seconds until the oldest attempt in the window ages out, rounded up,
 floor of 1.

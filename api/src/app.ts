@@ -80,6 +80,9 @@ const onError: ErrorRequestHandler = (err, _req, res, next) => {
   if (res.headersSent) return next(err);
 
   if (err instanceof ApiError) {
+    for (const [name, value] of Object.entries(err.headers)) {
+      res.setHeader(name, value);
+    }
     res.status(err.status).json({ error: err.message });
     return;
   }

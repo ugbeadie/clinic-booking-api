@@ -28,9 +28,11 @@ resetRouter.post("/reset", async (req, res) => {
     await client.query("BEGIN");
     await client.query("DELETE FROM bookings");
     await client.query("DELETE FROM slots");
-    // A fixture reset clears the level 4 keys too, otherwise a key stored by an
-    // earlier test would replay its old answer into a later one.
+    // A fixture reset clears the level 4 keys and level 5 counters too.
+    // Otherwise a key stored earlier would replay its old answer into a later
+    // request, and attempts already spent would count against a fresh start.
     await client.query("DELETE FROM idempotency_keys");
+    await client.query("DELETE FROM booking_attempts");
     for (const s of slots) {
       // ON CONFLICT so a repeated id in one payload is "last one wins" rather
       // than a primary-key error halfway through.

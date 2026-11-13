@@ -67,6 +67,19 @@ CREATE TABLE IF NOT EXISTS idempotency_keys (
   response_body jsonb,
   created_at    timestamptz NOT NULL DEFAULT now()
 );
+
+-- Level 5: one row per booking attempt, so "five per email per minute" can be
+-- counted. In the database rather than in memory on purpose - Render can
+-- restart the process or run more than one of it, and a counter living in one
+-- process would protect nothing.
+CREATE TABLE IF NOT EXISTS booking_attempts (
+  id         bigserial      PRIMARY KEY,
+  email      text           NOT NULL,
+  created_at timestamptz(3) NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS booking_attempts_by_email
+  ON booking_attempts (email, created_at);
 `;
 
 async function main() {
