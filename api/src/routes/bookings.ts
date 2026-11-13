@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { Router } from "express";
 import { isUniqueViolation, pool } from "../db.js";
 import { fail } from "../errors.js";
@@ -28,22 +28,24 @@ function readBooking(body: any) {
 }
 
 /**
- * Book a slot.
+ * What a booking attempt came to: a status code and a JSON body.
  *
- * Levels 1 and 2. Idempotency and rate limiting arrive at levels 4 and 5; the
- * order they slot into is in docs/DESIGN.md §3.
+ * `book` returns one of these instead of throwing, because level 4 has to be
+ * able to save whatever happened under an Idempotency-Key and hand the same
+ * answer back to a retry.
  */
-bookingsRouter.post("/bookings", async (req, res) => {
-  const { slotId, name, email } = readBooking(req.body);
+type Outcome = { status: number; body: unknown };
 
+/** Levels 1-3: make the booking, or report why not. */
+async function book(slotId: string, name: string, email: string): Promise<Outcome> {
   // One query answers both questions. `now()` is the database's clock, so the
   // answer does not depend on this server's clock being right.
   const slot = await pool.query<{ started: boolean }>(
     "SELECT start_at <= now() AS started FROM slots WHERE id = $1",
     [slotId],
   );
-  if (slot.rowCount === 0) throw fail(404, "slot not found");
-  if (slot.rows[0]!.started) throw fail(400, "slot has already started");
+  if (slot.rowCount === 0) return { status: 404, body: { error: "slot not found" } };
+  if (slot.rows[0]!.started) return { status: 400, body: { error: "slot has already started" } };
 
   try {
     const { rows } = await pool.query<BookingRow>(
@@ -52,17 +54,176 @@ bookingsRouter.post("/bookings", async (req, res) => {
        RETURNING *`,
       [randomUUID(), slotId, name, email],
     );
-    res.status(201).json(toBooking(rows[0]!));
+    return { status: 201, body: toBooking(rows[0]!) };
   } catch (err) {
     // Notice there is no "is this slot available?" check anywhere above. That
     // check is exactly what breaks when two requests arrive together - both
     // would read "available" before either writes. So we attempt the insert and
     // let the database arbitrate; it owns the rule, not this code.
     if (isUniqueViolation(err, "bookings_one_confirmed_per_slot")) {
-      throw fail(409, "slot already booked");
+      return { status: 409, body: { error: "slot already booked" } };
     }
     throw err;
   }
+}
+
+// --- Level 4: a retried request never creates a second booking --------------
+
+/**
+ * A fingerprint of the request. Built from the cleaned-up fields rather than
+ * the raw JSON text, so the same request with its keys in a different order, or
+ * with stray spaces, is recognised as the same request instead of being
+ * refused as a different one.
+ */
+const fingerprint = (slotId: string, name: string, email: string) =>
+  createHash("sha256").update(JSON.stringify([slotId, name, email])).digest("hex");
+
+type KeyRow = { request_hash: string; status_code: number | null; response_body: unknown };
+
+const readKey = async (key: string) =>
+  (
+    await pool.query<KeyRow>(
+      "SELECT request_hash, status_code, response_body FROM idempotency_keys WHERE key = $1",
+      [key],
+    )
+  ).rows[0];
+
+/**
+ * Claim the key. Returns true if it is now ours to work on, false if someone
+ * got there first - the primary key makes that decision, so two requests
+ * arriving together cannot both claim it.
+ */
+async function claimKey(key: string, hash: string): Promise<boolean> {
+  const { rowCount } = await pool.query(
+    `INSERT INTO idempotency_keys (key, request_hash) VALUES ($1, $2)
+     ON CONFLICT (key) DO NOTHING`,
+    [key, hash],
+  );
+  return rowCount === 1;
+}
+
+/** The answer already stored under this key - waiting for it if need be. */
+async function storedAnswer(key: string, hash: string): Promise<Outcome> {
+  // Up to two seconds, because the request that claimed this key may still be
+  // working on it. Normally the answer is already there on the first look.
+  for (let attempt = 0; attempt < 40; attempt++) {
+    const row = await readKey(key);
+    if (!row) break;
+    if (row.request_hash !== hash) {
+      throw fail(422, "this Idempotency-Key was already used with a different body");
+    }
+    if (row.status_code !== null) {
+      return { status: row.status_code, body: row.response_body };
+    }
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  throw fail(409, "a request with this Idempotency-Key is still in progress");
+}
+
+/**
+ * Book a slot.
+ *
+ * Without an Idempotency-Key this is just `book`. With one: claim the key, do
+ * the work, write the answer next to the key. Any later request carrying the
+ * same key gets that stored answer and never reaches `book` at all - so a retry
+ * cannot make a second booking. The same key with a different body is a 422.
+ */
+bookingsRouter.post("/bookings", async (req, res) => {
+  const { slotId, name, email } = readBooking(req.body);
+  const key = req.header("Idempotency-Key")?.trim() || null;
+
+  if (!key) {
+    const outcome = await book(slotId, name, email);
+    res.status(outcome.status).json(outcome.body);
+    return;
+  }
+
+  const hash = fingerprint(slotId, name, email);
+
+  if (!(await claimKey(key, hash))) {
+    const outcome = await storedAnswer(key, hash);
+    res.status(outcome.status).json(outcome.body);
+    return;
+  }
+
+  const outcome = await book(slotId, name, email);
+  await pool.query(
+    "UPDATE idempotency_keys SET status_code = $2, response_body = $3 WHERE key = $1",
+    [key, outcome.status, JSON.stringify(outcome.body)],
+  );
+  res.status(outcome.status).json(outcome.body);
+});
+
+// --- Level 4: paging through one person's bookings --------------------------
+
+function readLimit(raw: unknown): number {
+  if (raw === undefined) return 10;
+  // Only digits: this rejects "abc", "1.5", "-1" and "" as well as 0 and 51.
+  if (typeof raw !== "string" || !/^\d+$/.test(raw)) {
+    throw fail(400, "limit must be a whole number from 1 to 50");
+  }
+  const limit = Number(raw);
+  if (limit < 1 || limit > 50) throw fail(400, "limit must be a whole number from 1 to 50");
+  return limit;
+}
+
+/**
+ * The cursor is just "where the last page stopped": a timestamp and an id,
+ * base64'd so it survives a URL. Both halves are needed - see the query below.
+ */
+const encodeCursor = (row: BookingRow) =>
+  Buffer.from(`${row.created_at.toISOString()}|${row.id}`).toString("base64url");
+
+function readCursor(raw: unknown): { at: string; id: string } | null {
+  if (raw === undefined) return null;
+  if (typeof raw !== "string" || raw === "") throw fail(400, "invalid cursor");
+  const [at, id] = Buffer.from(raw, "base64url").toString("utf8").split("|");
+  if (!at || !id || Number.isNaN(Date.parse(at))) throw fail(400, "invalid cursor");
+  return { at, id };
+}
+
+/**
+ * Level 4 - this person's bookings, oldest first, a page at a time.
+ *
+ * `(created_at, id) > ($2, $3)` compares the pair, not just the timestamp. Two
+ * bookings made in the same instant would otherwise be in no particular order
+ * between pages, and one of them could be skipped or sent twice. Ordering by
+ * the same pair the cursor seeks on is what makes the paging stable.
+ */
+const PAGE_SQL = `
+  SELECT * FROM bookings
+   WHERE email = $1
+     AND ($2::timestamptz IS NULL OR (created_at, id) > ($2::timestamptz, $3::text))
+   ORDER BY created_at, id
+   LIMIT $4
+`;
+
+bookingsRouter.get("/bookings", async (req, res) => {
+  // Emails are stored lower case, so matching case-insensitively is just a
+  // matter of lowering the query too - no scan over every row.
+  const email = typeof req.query.email === "string" ? req.query.email.trim().toLowerCase() : "";
+  if (!email) throw fail(400, "email is required");
+
+  const limit = readLimit(req.query.limit);
+  const after = readCursor(req.query.cursor);
+
+  // Ask for one more row than the page needs: if it comes back, there is
+  // another page, and we can say so without guessing.
+  const { rows } = await pool.query<BookingRow>(PAGE_SQL, [
+    email,
+    after?.at ?? null,
+    after?.id ?? null,
+    limit + 1,
+  ]);
+
+  const page = rows.slice(0, limit);
+  const hasMore = rows.length > limit;
+  const last = page[page.length - 1];
+
+  res.json({
+    bookings: page.map(toBooking),
+    next_cursor: hasMore && last ? encodeCursor(last) : null,
+  });
 });
 
 /** Level 1 - look up a booking. A cancelled booking is returned as itself. */

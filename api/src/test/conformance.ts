@@ -434,6 +434,214 @@ async function level3() {
   });
 }
 
+// --- level 4 ----------------------------------------------------------------
+
+const L4_SLOTS = Array.from({ length: 6 }, (_, i) => ({
+  id: `k${i + 1}`,
+  provider: "Dr Ade",
+  start: future(60 * (i + 1)),
+  end: future(60 * (i + 1) + 30),
+}));
+
+async function level4() {
+  console.log("\nLevel 4 — retries never duplicate, and paging through bookings");
+
+  await check("POST /reset installs the level 4 fixture", async () => {
+    expectStatus(await call("POST", "/reset", { body: { slots: L4_SLOTS } }), 200);
+  });
+
+  const body = { slot_id: "k1", name: "Ada Obi", email: "ada@example.com" };
+  let firstId = "";
+
+  await check("a booking with an Idempotency-Key is created normally", async () => {
+    const res = await call("POST", "/bookings", { body, headers: { "Idempotency-Key": "key-1" } });
+    expectStatus(res, 201);
+    firstId = res.body.id;
+  });
+
+  await check("the same key with the same body replays the same response", async () => {
+    const res = await call("POST", "/bookings", { body, headers: { "Idempotency-Key": "key-1" } });
+    expectStatus(res, 201);
+    expect(res.body.id === firstId, `expected id ${firstId}, got ${res.body.id}`);
+  });
+
+  await check("...and a third time, still the same", async () => {
+    const res = await call("POST", "/bookings", { body, headers: { "Idempotency-Key": "key-1" } });
+    expectStatus(res, 201);
+    expect(res.body.id === firstId, `expected id ${firstId}, got ${res.body.id}`);
+  });
+
+  await check("only one booking exists for that person", async () => {
+    const res = await call("GET", "/bookings?email=ada@example.com");
+    expectStatus(res, 200);
+    expect(res.body.bookings.length === 1, `expected 1 booking, got ${res.body.bookings.length}`);
+  });
+
+  await check("key order and stray spaces still count as the same request", async () => {
+    const res = await call("POST", "/bookings", {
+      body: { email: " ADA@example.com ", name: " Ada Obi ", slot_id: "k1" },
+      headers: { "Idempotency-Key": "key-1" },
+    });
+    expectStatus(res, 201);
+    expect(res.body.id === firstId, `expected id ${firstId}, got ${res.body.id}`);
+  });
+
+  await check("the same key with a different body is a 422", async () => {
+    const res = await call("POST", "/bookings", {
+      body: { slot_id: "k2", name: "Ada Obi", email: "ada@example.com" },
+      headers: { "Idempotency-Key": "key-1" },
+    });
+    expectStatus(res, 422);
+    expectErrorShape(res);
+  });
+
+  await check("a different key is a different request", async () => {
+    const res = await call("POST", "/bookings", {
+      body: { slot_id: "k2", name: "Ada Obi", email: "ada@example.com" },
+      headers: { "Idempotency-Key": "key-2" },
+    });
+    expectStatus(res, 201);
+    expect(res.body.id !== firstId, "should be a new booking");
+  });
+
+  await check("two retries arriving at once still make one booking", async () => {
+    const both = await Promise.all([
+      call("POST", "/bookings", {
+        body: { slot_id: "k3", name: "Bola Eze", email: "bola@example.com" },
+        headers: { "Idempotency-Key": "key-3" },
+      }),
+      call("POST", "/bookings", {
+        body: { slot_id: "k3", name: "Bola Eze", email: "bola@example.com" },
+        headers: { "Idempotency-Key": "key-3" },
+      }),
+    ]);
+    expect(
+      both[0]!.status === 201 && both[1]!.status === 201,
+      `both should be 201, got ${both.map((r) => r.status).join(" and ")}`,
+    );
+    expect(
+      both[0]!.body.id === both[1]!.body.id,
+      `both should be the same booking, got ${both[0]!.body.id} and ${both[1]!.body.id}`,
+    );
+
+    const list = await call("GET", "/bookings?email=bola@example.com");
+    expect(list.body.bookings.length === 1, `expected 1 booking, got ${list.body.bookings.length}`);
+  });
+
+  await check("without a key, a repeat is just a 409", async () => {
+    const res = await call("POST", "/bookings", {
+      body: { slot_id: "k1", name: "Someone Else", email: "else@example.com" },
+    });
+    expectStatus(res, 409);
+  });
+
+  // --- paging ---
+
+  console.log("  paging:");
+
+  /** Six bookings for one person, made one after another so the order is known. */
+  const madeIds: string[] = [];
+
+  await check("set up six bookings for one email", async () => {
+    expectStatus(await call("POST", "/reset", { body: { slots: L4_SLOTS } }), 200);
+    for (const slot of L4_SLOTS) {
+      const res = await call("POST", "/bookings", {
+        body: { slot_id: slot.id, name: "Ada Obi", email: "ada@example.com" },
+      });
+      expectStatus(res, 201);
+      madeIds.push(res.body.id);
+    }
+    expect(madeIds.length === 6, `expected 6 bookings, got ${madeIds.length}`);
+  });
+
+  await check("email is required", async () => {
+    const res = await call("GET", "/bookings");
+    expectStatus(res, 400);
+    expectErrorShape(res);
+  });
+
+  for (const bad of ["0", "51", "-1", "1.5", "abc", ""]) {
+    await check(`limit=${JSON.stringify(bad)} is a 400`, async () => {
+      const res = await call("GET", `/bookings?email=ada@example.com&limit=${bad}`);
+      expectStatus(res, 400);
+      expectErrorShape(res);
+    });
+  }
+
+  await check("a garbage cursor is a 400", async () => {
+    const res = await call("GET", "/bookings?email=ada@example.com&cursor=not-a-cursor");
+    expectStatus(res, 400);
+    expectErrorShape(res);
+  });
+
+  await check("the default page holds everything here, oldest first", async () => {
+    const res = await call("GET", "/bookings?email=ada@example.com");
+    expectStatus(res, 200);
+    const ids = res.body.bookings.map((b: any) => b.id);
+    expect(
+      JSON.stringify(ids) === JSON.stringify(madeIds),
+      "bookings should come back in the order they were made",
+    );
+    expect(res.body.next_cursor === null, `next_cursor should be null, got ${res.body.next_cursor}`);
+  });
+
+  await check("limit=2 pages through all six without gaps or repeats", async () => {
+    const seen: string[] = [];
+    let cursor: string | null = null;
+    let pages = 0;
+
+    do {
+      const query = `email=ada@example.com&limit=2${cursor ? `&cursor=${encodeURIComponent(cursor)}` : ""}`;
+      const res = await call("GET", `/bookings?${query}`);
+      expectStatus(res, 200);
+      expect(res.body.bookings.length <= 2, `page too big: ${res.body.bookings.length}`);
+      seen.push(...res.body.bookings.map((b: any) => b.id));
+      cursor = res.body.next_cursor;
+      pages++;
+      expect(pages <= 10, "too many pages - the cursor is probably not advancing");
+    } while (cursor !== null);
+
+    expect(pages === 3, `expected 3 pages of 2, got ${pages}`);
+    expect(
+      JSON.stringify(seen) === JSON.stringify(madeIds),
+      `paged ids do not match: ${JSON.stringify(seen)}`,
+    );
+    expect(new Set(seen).size === seen.length, "a booking appeared on two pages");
+  });
+
+  await check("the last page says next_cursor: null", async () => {
+    const first = await call("GET", "/bookings?email=ada@example.com&limit=5");
+    expect(first.body.next_cursor !== null, "page 1 of 2 should have a cursor");
+    const last = await call(
+      "GET",
+      `/bookings?email=ada@example.com&limit=5&cursor=${encodeURIComponent(first.body.next_cursor)}`,
+    );
+    expect(last.body.bookings.length === 1, `expected 1 left over, got ${last.body.bookings.length}`);
+    expect(last.body.next_cursor === null, "the last page should have no cursor");
+  });
+
+  await check("the email match ignores case", async () => {
+    const res = await call("GET", "/bookings?email=ADA@Example.COM");
+    expectStatus(res, 200);
+    expect(res.body.bookings.length === 6, `expected 6 bookings, got ${res.body.bookings.length}`);
+  });
+
+  await check("someone with no bookings gets an empty page, not a 404", async () => {
+    const res = await call("GET", "/bookings?email=nobody@example.com");
+    expectStatus(res, 200);
+    expect(res.body.bookings.length === 0, "expected no bookings");
+    expect(res.body.next_cursor === null, "expected no cursor");
+  });
+
+  await check("cancelled bookings are still listed", async () => {
+    expectStatus(await call("DELETE", `/bookings/${madeIds[0]}`), 200);
+    const res = await call("GET", "/bookings?email=ada@example.com");
+    expect(res.body.bookings.length === 6, `expected 6 bookings, got ${res.body.bookings.length}`);
+    const cancelled = res.body.bookings.find((b: any) => b.id === madeIds[0]);
+    expect(cancelled?.status === "cancelled", `status: ${cancelled?.status}`);
+  });
+}
+
 // --- cross-cutting: the error shape has no exceptions -----------------------
 
 async function errorShape() {
@@ -475,6 +683,7 @@ async function main() {
   await level1();
   await level2();
   await level3();
+  await level4();
   await errorShape();
 
   console.log(`\n${passed} passed, ${failures.length} failed`);
