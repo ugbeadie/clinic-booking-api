@@ -6,27 +6,51 @@ import { toBooking, type BookingRow } from "../serialize.js";
 
 export const bookingsRouter = Router();
 
+// "something@something.something", with no spaces. Not the full RFC - that is a
+// famously unreadable regex - but it rejects everything a real typo looks like.
+const EMAIL = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+
 /**
- * Book a slot. Level 1 is the happy path: 201 with the booking, confirmed.
+ * Level 2 - reject bookings with missing or invalid details, and clean up the
+ * ones we accept: spaces trimmed, email stored lower case.
+ */
+function readBooking(body: any) {
+  const slotId = typeof body?.slot_id === "string" ? body.slot_id.trim() : "";
+  const name = typeof body?.name === "string" ? body.name.trim() : "";
+  const email = typeof body?.email === "string" ? body.email.trim().toLowerCase() : "";
+
+  if (!slotId) throw fail(400, "slot_id is required");
+  if (!name) throw fail(400, "name is required");
+  if (!email) throw fail(400, "email is required");
+  if (!EMAIL.test(email)) throw fail(400, "email is not valid");
+
+  return { slotId, name, email };
+}
+
+/**
+ * Book a slot.
  *
- * Two later-level responses are already here, because the alternative was a
- * 500: the foreign key raises an error for a slot that does not exist (404,
- * level 2) and the unique index raises one for a slot already taken (409,
- * level 3). Validation, idempotency and rate limiting arrive at their levels -
- * the order they slot into is in docs/DESIGN.md §3.
+ * Levels 1 and 2. Idempotency and rate limiting arrive at levels 4 and 5; the
+ * order they slot into is in docs/DESIGN.md §3.
  */
 bookingsRouter.post("/bookings", async (req, res) => {
-  const { slot_id, name, email } = req.body ?? {};
+  const { slotId, name, email } = readBooking(req.body);
 
-  const slot = await pool.query("SELECT id FROM slots WHERE id = $1", [slot_id ?? ""]);
+  // One query answers both questions. `now()` is the database's clock, so the
+  // answer does not depend on this server's clock being right.
+  const slot = await pool.query<{ started: boolean }>(
+    "SELECT start_at <= now() AS started FROM slots WHERE id = $1",
+    [slotId],
+  );
   if (slot.rowCount === 0) throw fail(404, "slot not found");
+  if (slot.rows[0]!.started) throw fail(400, "slot has already started");
 
   try {
     const { rows } = await pool.query<BookingRow>(
       `INSERT INTO bookings (id, slot_id, name, email, status)
        VALUES ($1, $2, $3, $4, 'confirmed')
        RETURNING *`,
-      [randomUUID(), slot_id, name ?? "", email ?? ""],
+      [randomUUID(), slotId, name, email],
     );
     res.status(201).json(toBooking(rows[0]!));
   } catch (err) {

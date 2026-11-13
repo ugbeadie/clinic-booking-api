@@ -61,22 +61,21 @@ The spec attaches five status codes to one endpoint across four levels. The orde
 are checked in is not stated, and it is the most consequential decision here.
 
 ```
-1.  CORS preflight            → answered, no auth
-2.  X-API-Key                 → 401
-3.  JSON parse                → 400
-4.  email present + valid     → 400
-5.  rate limit on that email  → 429 + Retry-After
-6.  Idempotency-Key gate      → 422 (same key, different body) | replay stored response
-7.  slot_id / name present    → 400
-8.  slot exists               → 404
-9.  slot.start <= now()       → 400
-10. insert                    → 409 if the slot already has a confirmed booking
-11. store the response under the idempotency key, commit
+1. CORS preflight                    → answered, no auth
+2. X-API-Key                         → 401
+3. JSON parse                        → 400
+4. validate + normalise all fields   → 400
+5. rate limit on the email           → 429 + Retry-After
+6. Idempotency-Key gate              → 422 (same key, different body) | replay stored response
+7. slot exists                       → 404
+8. slot.start <= now()               → 400
+9. insert                            → 409 if the slot already has a confirmed booking
+10. store the response under the idempotency key, commit
 ```
 
 Reasoning for the contested positions:
 
-- **Rate limit (5) before the slot checks (8–10):** level 5 says failed attempts count.
+- **Rate limit (5) before the slot checks (7–9):** level 5 says failed attempts count.
   A client firing six requests at a nonexistent slot must see 404 ×5 then 429. If the
   limit were checked last, those 404s would never be counted.
 - **Rate limit (5) before idempotency (6):** a genuine trade-off. Putting it first
@@ -85,9 +84,13 @@ Reasoning for the contested positions:
   same response". Putting idempotency first would let a client bypass the limit by
   reusing one key. Level 5's rule is written without exceptions, so it wins; real
   retries number two or three, not six.
-- **Email validated before the things that depend on it:** the rate limit is keyed on
-  email, so there is no counter to charge until the email is known. A request with no
-  usable email is a 400 and is not counted — there is nothing to count it against.
+- **All validation in one step (4), ahead of the rate limit:** the rate limit is keyed
+  on email, so there is no counter to charge until the email is known — validation has
+  to come first either way. An earlier draft validated the email alone at step 4 and
+  the other fields after the rate limit, so that a request with a valid email but an
+  empty name would still be counted as an attempt. That split costs more in
+  explanation than it buys: the trade is that a malformed request is rejected without
+  burning any of that email's budget, which no reasonable reading of level 5 requires.
 - **A rejected (429) request is not itself recorded as an attempt.** Otherwise the
   window would keep extending itself and a blocked client could never recover.
 

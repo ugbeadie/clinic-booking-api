@@ -1,4 +1,5 @@
 import express, { type ErrorRequestHandler } from "express";
+import { requireApiKey } from "./auth.js";
 import { pool } from "./db.js";
 import { ApiError } from "./errors.js";
 import { bookingsRouter } from "./routes/bookings.js";
@@ -40,13 +41,6 @@ app.use((req, res, next) => {
   next();
 });
 
-// `type: () => true` parses the body whatever Content-Type it arrives with. A
-// client that posts JSON without the header is common, and the alternative
-// failure - seeing an empty body and complaining that slot_id is missing when
-// it was not - is much worse to debug. A body that is not JSON becomes a
-// SyntaxError, handled as a 400 below.
-app.use(express.json({ limit: "256kb", type: () => true }));
-
 // Deliberately above the API-key check: an uptime pinger hits this every few
 // minutes to keep Render and the Neon compute awake, and should not need a
 // secret to do it. It queries the database, because "is the process up" is not
@@ -55,6 +49,17 @@ app.get("/health", async (_req, res) => {
   await pool.query("SELECT 1");
   res.json({ ok: true });
 });
+
+// Everything below this line needs the API key. Above body parsing on purpose:
+// a request we are going to reject should not get its body parsed first.
+app.use(requireApiKey);
+
+// `type: () => true` parses the body whatever Content-Type it arrives with. A
+// client that posts JSON without the header is common, and the alternative
+// failure - seeing an empty body and complaining that slot_id is missing when
+// it was not - is much worse to debug. A body that is not JSON becomes a
+// SyntaxError, handled as a 400 below.
+app.use(express.json({ limit: "256kb", type: () => true }));
 
 app.use(resetRouter);
 app.use(slotsRouter);

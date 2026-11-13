@@ -22,9 +22,17 @@ type Response_ = { status: number; body: any; headers: Headers; text: string };
 async function call(
   method: string,
   path: string,
-  opts: { body?: unknown; raw?: string; headers?: Record<string, string> } = {},
+  opts: {
+    body?: unknown;
+    raw?: string;
+    headers?: Record<string, string>;
+    /** A different key, or null to send no key header at all. */
+    key?: string | null;
+  } = {},
 ): Promise<Response_> {
-  const headers: Record<string, string> = { "X-API-Key": KEY, ...opts.headers };
+  const key = opts.key === undefined ? KEY : opts.key;
+  const headers: Record<string, string> = { ...opts.headers };
+  if (key !== null) headers["X-API-Key"] = key;
   let body: string | undefined;
 
   if (opts.raw !== undefined) {
@@ -220,6 +228,97 @@ async function level1() {
   });
 }
 
+// --- level 2 ----------------------------------------------------------------
+
+/** A slot in the past and one in the future, for the "already started" rule. */
+const L2_SLOTS = [
+  { id: "past", provider: "Dr Ade", start: future(-120), end: future(-90) },
+  { id: "soon", provider: "Dr Ade", start: future(60), end: future(90) },
+  { id: "later", provider: "Dr Ade", start: future(180), end: future(210) },
+];
+
+async function level2() {
+  console.log("\nLevel 2 — the API key, and turning away bad details");
+
+  await check("no API key is a 401", async () => {
+    const res = await call("GET", "/slots", { key: null });
+    expectStatus(res, 401);
+    expectErrorShape(res);
+  });
+
+  await check("a wrong API key is a 401", async () => {
+    const res = await call("GET", "/slots", { key: "not-the-key" });
+    expectStatus(res, 401);
+    expectErrorShape(res);
+  });
+
+  await check("/reset needs the key too", async () => {
+    const res = await call("POST", "/reset", { key: null, body: { slots: [] } });
+    expectStatus(res, 401);
+  });
+
+  await check("/health works without a key, so a pinger can keep us warm", async () => {
+    const res = await call("GET", "/health", { key: null });
+    expectStatus(res, 200);
+  });
+
+  await check("POST /reset installs the level 2 fixture", async () => {
+    const res = await call("POST", "/reset", { body: { slots: L2_SLOTS } });
+    expectStatus(res, 200);
+  });
+
+  const missing: Array<[string, Record<string, unknown>]> = [
+    ["slot_id missing", { name: "Ada Obi", email: "ada@example.com" }],
+    ["slot_id empty", { slot_id: "   ", name: "Ada Obi", email: "ada@example.com" }],
+    ["name missing", { slot_id: "soon", email: "ada@example.com" }],
+    ["name empty", { slot_id: "soon", name: "   ", email: "ada@example.com" }],
+    ["email missing", { slot_id: "soon", name: "Ada Obi" }],
+    ["email empty", { slot_id: "soon", name: "Ada Obi", email: "  " }],
+    ["email has no @", { slot_id: "soon", name: "Ada Obi", email: "not-an-email" }],
+    ["email has no domain", { slot_id: "soon", name: "Ada Obi", email: "ada@" }],
+    ["email has no dot", { slot_id: "soon", name: "Ada Obi", email: "ada@example" }],
+    ["email has a space", { slot_id: "soon", name: "Ada Obi", email: "a b@example.com" }],
+    ["name is not a string", { slot_id: "soon", name: 42, email: "ada@example.com" }],
+  ];
+
+  for (const [label, body] of missing) {
+    await check(`400 when ${label}`, async () => {
+      const res = await call("POST", "/bookings", { body });
+      expectStatus(res, 400);
+      expectErrorShape(res);
+    });
+  }
+
+  await check("400 when the slot has already started", async () => {
+    const res = await call("POST", "/bookings", {
+      body: { slot_id: "past", name: "Ada Obi", email: "ada@example.com" },
+    });
+    expectStatus(res, 400);
+    expectErrorShape(res);
+  });
+
+  await check("404 beats nothing: a valid body for a slot that does not exist", async () => {
+    const res = await call("POST", "/bookings", {
+      body: { slot_id: "nope", name: "Ada Obi", email: "ada@example.com" },
+    });
+    expectStatus(res, 404);
+    expectErrorShape(res);
+  });
+
+  await check("name is trimmed and email is stored lower case", async () => {
+    const res = await call("POST", "/bookings", {
+      body: { slot_id: "soon", name: "  Ada Obi  ", email: "  ADA@Example.COM " },
+    });
+    expectStatus(res, 201);
+    expect(res.body.name === "Ada Obi", `name: ${JSON.stringify(res.body.name)}`);
+    expect(res.body.email === "ada@example.com", `email: ${JSON.stringify(res.body.email)}`);
+
+    // and it is stored that way, not just echoed that way
+    const again = await call("GET", `/bookings/${res.body.id}`);
+    expect(again.body.email === "ada@example.com", `stored email: ${again.body.email}`);
+  });
+}
+
 // --- cross-cutting: the error shape has no exceptions -----------------------
 
 async function errorShape() {
@@ -259,6 +358,7 @@ async function main() {
   if (!KEY) console.log("note: no API_KEY set — fine until level 2");
 
   await level1();
+  await level2();
   await errorShape();
 
   console.log(`\n${passed} passed, ${failures.length} failed`);
