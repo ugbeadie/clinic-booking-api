@@ -3,6 +3,10 @@ import { pool } from "./db.js";
 /**
  * The whole schema, idempotent, so it is safe to run on every deploy.
  * It grows as the levels do.
+ *
+ * Everything is created first, then the handful of ALTERs at the bottom bring
+ * an older database in line. That order matters: an ALTER above the CREATE it
+ * refers to would fail on a database that does not have the table yet.
  */
 const SCHEMA = `
 -- Why timestamptz(3) and not plain timestamptz: (3) means "to the
@@ -26,14 +30,6 @@ CREATE TABLE IF NOT EXISTS bookings (
   status     text           NOT NULL CHECK (status IN ('confirmed', 'cancelled')),
   created_at timestamptz(3) NOT NULL DEFAULT now()
 );
-
--- CREATE TABLE IF NOT EXISTS cannot change a table that already exists, so
--- these bring a database created before the line above into line. Re-running
--- them does nothing. (This is the limit of a create-only migration script,
--- noted in docs/DESIGN.md - the first time it actually bit.)
-ALTER TABLE slots    ALTER COLUMN start_at   TYPE timestamptz(3);
-ALTER TABLE slots    ALTER COLUMN end_at     TYPE timestamptz(3);
-ALTER TABLE bookings ALTER COLUMN created_at TYPE timestamptz(3);
 
 -- The most important line in the project (level 3), created now because it is
 -- cheap and awkward to retrofit.
@@ -60,11 +56,16 @@ CREATE INDEX IF NOT EXISTS bookings_by_email
 -- response_body are null while the first request holding this key is still
 -- working, and hold its answer once it finishes - that answer is what every
 -- retry gets back.
+--
+-- json rather than jsonb: jsonb reorders object keys, so a replayed response
+-- was semantically identical to the original but not byte-identical. The spec
+-- only asks for the same status code and the same booking id, so either would
+-- pass; json stores the text exactly as written and removes the question.
 CREATE TABLE IF NOT EXISTS idempotency_keys (
   key           text        PRIMARY KEY,
   request_hash  text        NOT NULL,
   status_code   integer,
-  response_body jsonb,
+  response_body json,
   created_at    timestamptz NOT NULL DEFAULT now()
 );
 
@@ -80,6 +81,15 @@ CREATE TABLE IF NOT EXISTS booking_attempts (
 
 CREATE INDEX IF NOT EXISTS booking_attempts_by_email
   ON booking_attempts (email, created_at);
+
+-- CREATE TABLE IF NOT EXISTS cannot change a table that already exists, so
+-- these bring a database created by an earlier version of this file into line.
+-- Re-running them does nothing. (This is the limit of a create-only migration
+-- script, which docs/DESIGN.md flagged at the start - it bit twice.)
+ALTER TABLE slots            ALTER COLUMN start_at      TYPE timestamptz(3);
+ALTER TABLE slots            ALTER COLUMN end_at        TYPE timestamptz(3);
+ALTER TABLE bookings         ALTER COLUMN created_at    TYPE timestamptz(3);
+ALTER TABLE idempotency_keys ALTER COLUMN response_body TYPE json;
 `;
 
 async function main() {
