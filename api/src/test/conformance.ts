@@ -319,6 +319,121 @@ async function level2() {
   });
 }
 
+// --- level 3 ----------------------------------------------------------------
+
+const L3_SLOTS = [
+  { id: "c1", provider: "Dr Ade", start: future(60), end: future(90) },
+  { id: "c2", provider: "Dr Ade", start: future(120), end: future(150) },
+];
+
+async function level3() {
+  console.log("\nLevel 3 — one booking per slot under load, and cancelling");
+
+  await check("POST /reset installs the level 3 fixture", async () => {
+    expectStatus(await call("POST", "/reset", { body: { slots: L3_SLOTS } }), 200);
+  });
+
+  /**
+   * The check this whole design exists for. Twenty requests for one slot, all
+   * in flight at once - not twenty one after another, which any implementation
+   * passes.
+   */
+  await check("20 simultaneous bookings of one slot: exactly one wins", async () => {
+    const attempts = Array.from({ length: 20 }, (_, i) =>
+      call("POST", "/bookings", {
+        body: { slot_id: "c1", name: `Racer ${i}`, email: `racer${i}@example.com` },
+      }),
+    );
+    const results = await Promise.all(attempts);
+
+    const created = results.filter((r) => r.status === 201);
+    const refused = results.filter((r) => r.status === 409);
+    const other = results.filter((r) => r.status !== 201 && r.status !== 409);
+
+    expect(
+      created.length === 1,
+      `expected exactly 1 booking, got ${created.length} (409s: ${refused.length})`,
+    );
+    expect(
+      other.length === 0,
+      `every other request should be 409, got ${other.map((r) => r.status).join(", ")}`,
+    );
+  });
+
+  await check("and the database really holds one confirmed booking", async () => {
+    const res = await call("GET", "/slots");
+    const c1 = res.body.slots.find((s: any) => s.id === "c1");
+    expect(c1.available === false, "c1 should be unavailable");
+  });
+
+  let bookingId = "";
+
+  await check("a fresh booking can be made on the other slot", async () => {
+    const res = await call("POST", "/bookings", {
+      body: { slot_id: "c2", name: "Ada Obi", email: "ada@example.com" },
+    });
+    expectStatus(res, 201);
+    bookingId = res.body.id;
+  });
+
+  await check("DELETE /bookings/{id} returns the cancelled booking", async () => {
+    const res = await call("DELETE", `/bookings/${bookingId}`);
+    expectStatus(res, 200);
+    expect(res.body.status === "cancelled", `status: ${res.body.status}`);
+    expect(res.body.id === bookingId, `id: ${res.body.id}`);
+  });
+
+  await check("cancelling frees the slot", async () => {
+    const res = await call("GET", "/slots");
+    const c2 = res.body.slots.find((s: any) => s.id === "c2");
+    expect(c2.available === true, "c2 should be available again");
+  });
+
+  await check("and the freed slot can be booked again", async () => {
+    const res = await call("POST", "/bookings", {
+      body: { slot_id: "c2", name: "Bola Eze", email: "bola@example.com" },
+    });
+    expectStatus(res, 201);
+  });
+
+  await check("a cancelled booking is still readable, as cancelled", async () => {
+    const res = await call("GET", `/bookings/${bookingId}`);
+    expectStatus(res, 200);
+    expect(res.body.status === "cancelled", `status: ${res.body.status}`);
+  });
+
+  await check("cancelling twice is a 409", async () => {
+    const res = await call("DELETE", `/bookings/${bookingId}`);
+    expectStatus(res, 409);
+    expectErrorShape(res);
+  });
+
+  await check("cancelling a booking that does not exist is a 404", async () => {
+    const res = await call("DELETE", "/bookings/does-not-exist");
+    expectStatus(res, 404);
+    expectErrorShape(res);
+  });
+
+  // The same race, the other way round: cancelling is a conditional update, so
+  // only one of ten simultaneous cancels should find the row confirmed.
+  await check("10 simultaneous cancels: exactly one succeeds", async () => {
+    await call("POST", "/reset", { body: { slots: L3_SLOTS } });
+    const made = await call("POST", "/bookings", {
+      body: { slot_id: "c1", name: "Ada Obi", email: "ada@example.com" },
+    });
+    expectStatus(made, 201);
+
+    const results = await Promise.all(
+      Array.from({ length: 10 }, () => call("DELETE", `/bookings/${made.body.id}`)),
+    );
+    const ok = results.filter((r) => r.status === 200);
+    const already = results.filter((r) => r.status === 409);
+
+    expect(ok.length === 1, `expected exactly 1 success, got ${ok.length}`);
+    expect(already.length === 9, `expected 9 conflicts, got ${already.length}`);
+  });
+}
+
 // --- cross-cutting: the error shape has no exceptions -----------------------
 
 async function errorShape() {
@@ -359,6 +474,7 @@ async function main() {
 
   await level1();
   await level2();
+  await level3();
   await errorShape();
 
   console.log(`\n${passed} passed, ${failures.length} failed`);

@@ -74,3 +74,35 @@ bookingsRouter.get("/bookings/:id", async (req, res) => {
   if (!booking) throw fail(404, "booking not found");
   res.json(toBooking(booking));
 });
+
+/**
+ * Level 3 - cancel a booking, which frees the slot.
+ *
+ * The `AND status = 'confirmed'` is what makes this safe: the database finds the
+ * row and changes it in one step, so two simultaneous cancels cannot both
+ * succeed. Reading the booking first and then updating it would let both see
+ * "confirmed" before either wrote.
+ *
+ * Nothing frees the slot explicitly. The slot was never marked as taken - it
+ * looked taken because a confirmed booking pointed at it, and the partial
+ * unique index only covers confirmed rows, so this one update does both jobs.
+ */
+bookingsRouter.delete("/bookings/:id", async (req, res) => {
+  const { rows } = await pool.query<BookingRow>(
+    `UPDATE bookings SET status = 'cancelled'
+      WHERE id = $1 AND status = 'confirmed'
+      RETURNING *`,
+    [req.params.id],
+  );
+
+  if (rows[0]) {
+    res.json(toBooking(rows[0]));
+    return;
+  }
+
+  // Nothing was updated. Either there is no such booking, or it was already
+  // cancelled - and the spec wants different codes for those.
+  const exists = await pool.query("SELECT 1 FROM bookings WHERE id = $1", [req.params.id]);
+  if (exists.rowCount === 0) throw fail(404, "booking not found");
+  throw fail(409, "booking is already cancelled");
+});
